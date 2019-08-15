@@ -1,0 +1,7 @@
+apiVersion: redapt.com/v1alpha1
+kind: Gitea
+metadata:
+  name: example-gitea
+spec:
+  # Add fields here
+  size: 3
