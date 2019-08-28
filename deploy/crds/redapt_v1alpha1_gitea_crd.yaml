@@ -29,8 +29,21 @@ spec:
           type: object
         spec:
           type: object
+          properties:
+            size:
+              format: int32
+              type: integer
+          required:
+          - size
         status:
           type: object
+          properties:
+            pods:
+              items:
+                type: string
+              type: array
+          required:
+          - pods
   version: v1alpha1
   versions:
   - name: v1alpha1

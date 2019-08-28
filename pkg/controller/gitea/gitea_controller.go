@@ -2,12 +2,15 @@ package gitea
 
 import (
 	"context"
+	"reflect"
 
 	redaptv1alpha1 "github.com/redapt/gitea-operator/pkg/apis/redapt/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -20,11 +23,6 @@ import (
 )
 
 var log = logf.Log.WithName("controller_gitea")
-
-/**
-* USER ACTION REQUIRED: This is a scaffold file intended for the user to modify with their own Controller
-* business logic.  Delete these comments after modifying this file.*
- */
 
 // Add creates a new Gitea Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
@@ -51,7 +49,6 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
-	// TODO(user): Modify this to be the types you create that are owned by the primary resource
 	// Watch for changes to secondary resource Pods and requeue the owner Gitea
 	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
@@ -77,8 +74,6 @@ type ReconcileGitea struct {
 
 // Reconcile reads that state of the cluster for a Gitea object and makes changes based on the state read
 // and what is in the Gitea.Spec
-// TODO(user): Modify this Reconcile function to implement your Controller logic.  This example creates
-// a Pod as an example
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
@@ -87,8 +82,8 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 	reqLogger.Info("Reconciling Gitea")
 
 	// Fetch the Gitea instance
-	instance := &redaptv1alpha1.Gitea{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	gitea := &redaptv1alpha1.Gitea{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, gitea)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -100,65 +95,128 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
 
-	// Set Gitea instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
+	// Check if this Deployment already exists
+	found := &appsv1.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: gitea.Name + "-deployment", Namespace: gitea.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
+		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", gitea.Namespace, "Deployment.Name", gitea.Name)
+		// Define a new Deployment object
+		deployment := newDeploymentForCR(gitea)
+		if err := controllerutil.SetControllerReference(gitea, deployment, r.scheme); err != nil {
+			return reconcile.Result{}, err
+		}
+		err = r.client.Create(context.TODO(), deployment)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
 
 		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
+		return reconcile.Result{Requeue: true}, nil
 	} else if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	// Ensure the deployment size is the same as the spec
+	size := gitea.Spec.Size
+	if *found.Spec.Replicas != size {
+		found.Spec.Replicas = &size
+		err = r.client.Update(context.TODO(), found)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Deployment.", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return reconcile.Result{}, err
+		}
+		// Spec updated - return and requeue
+		return reconcile.Result{Requeue: true}, nil
+	}
+
+	// Update deployment status with the pod names
+	// TODO: currently correct on initial deploy, then on edits it's 1 edit behind.  For example, deploy with size 3, edit to size 1 - it will show original 3 pods, edit back to size 3 - it will show 1 pod
+	podList := &corev1.PodList{}
+	labelSelector := labels.SelectorFromSet(
+		map[string]string{
+			"app": gitea.Name,
+		})
+	listOps := &client.ListOptions{
+		Namespace:     gitea.Namespace,
+		LabelSelector: labelSelector,
+	}
+	err = r.client.List(context.TODO(), listOps, podList)
+	if err != nil {
+		reqLogger.Error(err, "Failed to list pods.", "Gitea.Namespace", gitea.Namespace, "Gitea.Name", gitea.Name)
+		return reconcile.Result{}, err
+	}
+	podNames := getPodNames(podList.Items)
+
+	// Update status.Pods if needed
+	if !reflect.DeepEqual(podNames, gitea.Status.Pods) {
+		gitea.Status.Pods = podNames
+		err := r.client.Status().Update(context.TODO(), gitea)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update deployment status.")
+			return reconcile.Result{}, err
+		}
+	}
+
+
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *redaptv1alpha1.Gitea) *corev1.Pod {
-	labels := map[string]string{
+func newDeploymentForCR(cr *redaptv1alpha1.Gitea) *appsv1.Deployment {
+	deploymentLabels := map[string]string{
 		"app": cr.Name,
 	}
-	return &corev1.Pod{
+	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
+			Name:      cr.Name + "-deployment",
 			Namespace: cr.Namespace,
-			Labels:    labels,
+			Labels:    deploymentLabels,
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "gitea",
-					Image:   "gitea/gitea:latest",
-					//Command: []string{"sleep", "3600"},
-					Ports:   []corev1.ContainerPort{
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &cr.Spec.Size,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: deploymentLabels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      cr.Name + "-pod",
+					Namespace: cr.Namespace,
+					Labels:    deploymentLabels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
 						{
-							ContainerPort: 3000,
-							Name: "port3000",
-						},
-						{
-							ContainerPort: 22,
-							HostPort: 2222,
-							Name: "ssh",
+							Name: "gitea",
+							Image: "gitea/gitea:latest",
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: 3000,
+									Name: "http-port",
+								},
+								{
+									ContainerPort: 22,
+									HostPort: 2222,
+									Name: "ssh-port",
+								},
+							},
 						},
 					},
 				},
 			},
+			Strategy:                appsv1.DeploymentStrategy{},
+			MinReadySeconds:         0,
+			RevisionHistoryLimit:    nil,
+			Paused:                  false,
+			ProgressDeadlineSeconds: nil,
 		},
 	}
+}
+
+// getPodNames returns the pod names of the array of pods passed in
+func getPodNames(pods []corev1.Pod) []string {
+	var podNames []string
+	for _, pod := range pods {
+		podNames = append(podNames, pod.Name)
+	}
+	return podNames
 }

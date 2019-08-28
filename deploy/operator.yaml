@@ -16,7 +16,7 @@ spec:
       containers:
         - name: gitea-operator
           # Replace this with the built image name
-          image: quay.io/paulwelch/gitea-operator:v0.0.1
+          image: quay.io/paulwelch/gitea-operator:v0.0.2
           command:
           - gitea-operator
           imagePullPolicy: Always
