@@ -143,9 +143,20 @@ func newPodForCR(cr *redaptv1alpha1.Gitea) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
+					Name:    "gitea",
+					Image:   "gitea/gitea:latest",
+					//Command: []string{"sleep", "3600"},
+					Ports:   []corev1.ContainerPort{
+						{
+							ContainerPort: 3000,
+							Name: "port3000",
+						},
+						{
+							ContainerPort: 22,
+							HostPort: 2222,
+							Name: "ssh",
+						},
+					},
 				},
 			},
 		},
