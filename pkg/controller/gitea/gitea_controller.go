@@ -131,7 +131,6 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 	}
 
 	// Update deployment status with the pod names
-	// TODO: currently correct on initial deploy, then on edits it's 1 edit behind.  For example, deploy with size 3, edit to size 1 - it will show original 3 pods, edit back to size 3 - it will show 1 pod
 	podList := &corev1.PodList{}
 	labelSelector := labels.SelectorFromSet(
 		map[string]string{
@@ -149,8 +148,11 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 	podNames := getPodNames(podList.Items)
 
 	// Update status.Pods if needed
-	if !reflect.DeepEqual(podNames, gitea.Status.Pods) {
+	if int32(len(podNames)) != size || !reflect.DeepEqual(podNames, gitea.Status.Pods) {
 		gitea.Status.Pods = podNames
+		if int32(len(podNames)) != size {
+			return reconcile.Result{Requeue: true}, nil
+		}
 		err := r.client.Status().Update(context.TODO(), gitea)
 		if err != nil {
 			reqLogger.Error(err, "Failed to update deployment status.")
