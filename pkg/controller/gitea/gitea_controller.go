@@ -2,15 +2,16 @@ package gitea
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"reflect"
 
 	redaptv1alpha1 "github.com/redapt/gitea-operator/pkg/apis/redapt/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -95,12 +96,32 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 		return reconcile.Result{}, err
 	}
 
+	//Check if the PVC already exists
+	pvcFound := &corev1.PersistentVolumeClaim{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: gitea.Name + "-pvc", Namespace: gitea.Namespace}, pvcFound)
+	if err != nil && errors.IsNotFound(err){
+		reqLogger.Info("Creating a new PVC", "PersistentVolumeClaim.Namespace", gitea.Namespace, "PersistentVolumeClaim.Name", gitea.Name + "-pvc")
+		pvc := newPVCForCR(gitea)
+		if err := controllerutil.SetControllerReference(gitea, pvc, r.scheme); err != nil {
+			return reconcile.Result{}, err
+		}
+		err = r.client.Create(context.TODO(), pvc)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+		// Pod created successfully - don't requeue
+		return reconcile.Result{Requeue: true}, nil
+	} else if err != nil {
+		return reconcile.Result{}, err
+	}
+
 
 	// Check if this Deployment already exists
-	found := &appsv1.Deployment{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: gitea.Name + "-deployment", Namespace: gitea.Namespace}, found)
+	deploymentFound := &appsv1.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: gitea.Name + "-deployment", Namespace: gitea.Namespace}, deploymentFound)
 	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", gitea.Namespace, "Deployment.Name", gitea.Name)
+		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", gitea.Namespace, "Deployment.Name", gitea.Name + "-deployment")
 		// Define a new Deployment object
 		deployment := newDeploymentForCR(gitea)
 		if err := controllerutil.SetControllerReference(gitea, deployment, r.scheme); err != nil {
@@ -119,11 +140,11 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 
 	// Ensure the deployment size is the same as the spec
 	size := gitea.Spec.Size
-	if *found.Spec.Replicas != size {
-		found.Spec.Replicas = &size
-		err = r.client.Update(context.TODO(), found)
+	if *deploymentFound.Spec.Replicas != size {
+		deploymentFound.Spec.Replicas = &size
+		err = r.client.Update(context.TODO(), deploymentFound)
 		if err != nil {
-			reqLogger.Error(err, "Failed to update Deployment.", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			reqLogger.Error(err, "Failed to update Deployment.", "Deployment.Namespace", deploymentFound.Namespace, "Deployment.Name", deploymentFound.Name)
 			return reconcile.Result{}, err
 		}
 		// Spec updated - return and requeue
@@ -140,9 +161,9 @@ func (r *ReconcileGitea) Reconcile(request reconcile.Request) (reconcile.Result,
 		Namespace:     gitea.Namespace,
 		LabelSelector: labelSelector,
 	}
-	err = r.client.List(context.TODO(), listOps, podList)
 	if err != nil {
 		reqLogger.Error(err, "Failed to list pods.", "Gitea.Namespace", gitea.Namespace, "Gitea.Name", gitea.Name)
+		err = r.client.List(context.TODO(), listOps, podList)
 		return reconcile.Result{}, err
 	}
 	podNames := getPodNames(podList.Items)
@@ -197,8 +218,24 @@ func newDeploymentForCR(cr *redaptv1alpha1.Gitea) *appsv1.Deployment {
 								},
 								{
 									ContainerPort: 22,
-									HostPort: 2222,
 									Name: "ssh-port",
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									MountPath: "/data",
+									Name: "gitea-data",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "gitea-data",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: cr.Name + "-pvc",
+									ReadOnly: false,
 								},
 							},
 						},
@@ -210,6 +247,29 @@ func newDeploymentForCR(cr *redaptv1alpha1.Gitea) *appsv1.Deployment {
 			RevisionHistoryLimit:    nil,
 			Paused:                  false,
 			ProgressDeadlineSeconds: nil,
+		},
+	}
+}
+
+func newPVCForCR(cr *redaptv1alpha1.Gitea) *corev1.PersistentVolumeClaim {
+	deploymentLabels := map[string]string{
+		"app": cr.Name,
+	}
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name + "-pvc",
+			Namespace: cr.Namespace,
+			Labels:    deploymentLabels,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteMany,
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("20Gi"),
+				},
+			},
 		},
 	}
 }
